@@ -24,6 +24,10 @@ class CnosRuntime
     private array $secretFactories = [];
     /** @var array<string, VaultDefinition> */
     private array $vaults = [];
+    /** @var array<string, string> */
+    private array $parsedArgs = [];
+    /** @var array<string, mixed> */
+    private array $fileOverrides = [];
 
     public function __construct(
         private readonly ServerProjection $projection,
@@ -37,6 +41,8 @@ class CnosRuntime
             }
         }
         $this->vaults = $projection->vaults;
+        $this->parsedArgs = self::parseCliArgs(array_slice($GLOBALS['argv'] ?? [], 1));
+        $this->fileOverrides = self::loadPatchFile(self::detectPatchPath($this->parsedArgs, $this->env));
         $this->populateEntries();
         $this->initRuntimeNamespaces();
     }
@@ -53,6 +59,28 @@ class CnosRuntime
     /** @return array{mixed, bool} */
     public function read(string $key): array
     {
+        if (str_starts_with($key, 'value.') && !empty($this->projection->overrides)) {
+            $stripped = substr($key, strlen('value.'));
+            $spec = $this->projection->overrides[$stripped] ?? null;
+            if ($spec !== null) {
+                // File override participates as the "cnos" source.
+                [$cnosVal, $cnosFound] = $this->fileOrCnos($key);
+                return self::applyOverride($spec, $cnosVal, $cnosFound, $this->parsedArgs, $this->env, $key);
+            }
+        }
+        // No OverrideSpec: file then CNOS.
+        if (array_key_exists($key, $this->fileOverrides)) {
+            return [$this->fileOverrides[$key], true];
+        }
+        return $this->readInternal($key, []);
+    }
+
+    /** @return array{mixed, bool} */
+    private function fileOrCnos(string $key): array
+    {
+        if (array_key_exists($key, $this->fileOverrides)) {
+            return [$this->fileOverrides[$key], true];
+        }
         return $this->readInternal($key, []);
     }
 
@@ -537,5 +565,144 @@ class CnosRuntime
         }
         $val = getenv($key);
         return $val !== false ? $val : null;
+    }
+
+    /** @param array<string, string> $parsedArgs @param array<string, mixed> $env */
+    private static function detectPatchPath(array $parsedArgs, array $env): ?string
+    {
+        $flagVal = $parsedArgs['--cnos-patch'] ?? '';
+        if ($flagVal !== '') return $flagVal;
+        $envVal = $env['CNOS_PATCH_FILE'] ?? '';
+        return $envVal !== '' ? $envVal : null;
+    }
+
+    /** @return array<string, mixed> */
+    private static function loadPatchFile(?string $path): array
+    {
+        if ($path === null || $path === '') return [];
+        $text = @file_get_contents($path);
+        if ($text === false) return [];
+        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        if ($ext === 'json') {
+            $decoded = @json_decode($text, true);
+            return is_array($decoded) ? $decoded : [];
+        }
+        return self::parsePatchProperties($text);
+    }
+
+    /** @return array<string, mixed> */
+    private static function parsePatchProperties(string $text): array
+    {
+        $result = [];
+        foreach (explode("\n", $text) as $line) {
+            $trimmed = trim($line);
+            if ($trimmed === '' || $trimmed[0] === '#' || $trimmed[0] === ';') continue;
+            $eq = strpos($trimmed, '=');
+            if ($eq === false) continue;
+            $key = trim(substr($trimmed, 0, $eq));
+            $raw = trim(substr($trimmed, $eq + 1));
+            if ($key === '') continue;
+            if ($raw === '') {
+                fwrite(STDERR, "cnos [warn]: patch file key \"$key\" has empty value — skipping\n");
+                continue;
+            }
+            $result[$key] = self::coercePropertyValue($raw);
+        }
+        return $result;
+    }
+
+    private static function coercePropertyValue(string $raw): mixed
+    {
+        if ($raw === 'true') return true;
+        if ($raw === 'false') return false;
+        if ($raw === 'null') return null;
+        if ((str_starts_with($raw, '"') && str_ends_with($raw, '"')) ||
+            (str_starts_with($raw, "'") && str_ends_with($raw, "'"))) {
+            return substr($raw, 1, -1);
+        }
+        if (is_numeric($raw)) return $raw + 0;
+        return $raw;
+    }
+
+    /** @param string[] $args @return array<string, string> */
+    private static function parseCliArgs(array $args): array
+    {
+        $result = [];
+        $i = 0;
+        while ($i < count($args)) {
+            $arg = $args[$i];
+            if (!str_starts_with($arg, '-')) { $i++; continue; }
+            $eq = strpos($arg, '=');
+            if ($eq !== false) {
+                $result[substr($arg, 0, $eq)] = substr($arg, $eq + 1);
+                $i++;
+                continue;
+            }
+            if (isset($args[$i + 1]) && !str_starts_with($args[$i + 1], '-')) {
+                $result[$arg] = $args[$i + 1];
+                $i += 2;
+            } else {
+                $result[$arg] = 'true';
+                $i++;
+            }
+        }
+        return $result;
+    }
+
+    /** @return array{mixed, bool} [value, valid] */
+    private static function coerceOverrideValue(string $raw, ?string $type): array
+    {
+        if ($raw === '') return [null, false];
+        return match ($type) {
+            'number' => is_numeric($raw) ? [$raw + 0, true] : [null, false],
+            'boolean' => [in_array($raw, ['true', '1', 'yes'], true), true],
+            'object', 'array' => (($v = json_decode($raw, true)) !== null) ? [$v, true] : [null, false],
+            default => [$raw, true],
+        };
+    }
+
+    /** @param array<string, string> $parsedArgs @param array<string, mixed> $env @return array{mixed, bool} */
+    private static function applyOverride(
+        OverrideSpec $spec,
+        mixed $cnosVal,
+        bool $cnosFound,
+        array $parsedArgs,
+        array $env,
+        string $key = ''
+    ): array {
+        $priority = $spec->priority ?: ['arg', 'env', 'cnos'];
+        $keyLabel = $key !== '' ? " for \"$key\"" : '';
+        foreach ($priority as $source) {
+            if ($source === 'arg') {
+                foreach ($spec->arg as $flag) {
+                    if (!isset($parsedArgs[$flag])) continue;
+                    $v = $parsedArgs[$flag];
+                    if ($v === '') {
+                        fwrite(STDERR, "cnos [warn]: arg \"$flag\" has empty value — skipping override$keyLabel\n");
+                        continue;
+                    }
+                    [$coerced, $valid] = self::coerceOverrideValue($v, $spec->type);
+                    if (!$valid) {
+                        fwrite(STDERR, "cnos [warn]: arg \"$flag\" value \"$v\" cannot be coerced to " . ($spec->type ?? 'string') . " — skipping override$keyLabel\n");
+                        continue;
+                    }
+                    return [$coerced, true];
+                }
+            } elseif ($source === 'env') {
+                foreach ($spec->env as $varName) {
+                    $v = $env[$varName] ?? (getenv($varName) ?: null);
+                    if ($v === null || $v === '') continue;
+                    [$coerced, $valid] = self::coerceOverrideValue((string) $v, $spec->type);
+                    if (!$valid) {
+                        fwrite(STDERR, "cnos [warn]: env \"$varName\" value \"$v\" cannot be coerced to " . ($spec->type ?? 'string') . " — skipping override$keyLabel\n");
+                        continue;
+                    }
+                    return [$coerced, true];
+                }
+            } elseif ($source === 'cnos') {
+                if ($cnosFound) return [$cnosVal, true];
+            }
+        }
+        return [$cnosVal, $cnosFound];
     }
 }
